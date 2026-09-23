@@ -11,7 +11,7 @@ import urllib.request
 import numpy as np
 import pytest
 
-from arduino.app_internal.edge_impulse import BoxStabilizer, LabelColors, VideoStreamServer, draw_detections
+from arduino.app_internal.edge_impulse import BoxStabilizer, LabelColors, VideoStreamServer, draw_crossing_line, draw_detections
 from arduino.app_internal.ei_inference import Box
 
 JPEG_A = b"\xff\xd8A\xff\xd9"
@@ -149,6 +149,28 @@ def test_label_chip_moves_inside_the_box_when_there_is_no_room_above():
 
 def box(label, score, x=100, y=100, w=50, h=50):
     return Box(label, score, x, y, w, h)
+
+
+def test_the_crossing_line_is_drawn_across_the_whole_frame():
+    frame = np.zeros((120, 160, 3), np.uint8)
+    drawn = draw_crossing_line(frame, (10, 40, 50, 40))
+    assert drawn is frame, "drawn in place"
+    assert (frame[40] == (255, 0, 255)).all(), "the horizontal magenta line reaches both edges, beyond its two points"
+    assert not frame[10].any() and not frame[100].any(), "rows away from the line stay untouched"
+
+
+def test_a_diagonal_crossing_line_is_extended_to_the_frame_borders():
+    frame = np.zeros((120, 160, 3), np.uint8)
+    draw_crossing_line(frame, (40, 40, 60, 60))
+    assert frame[0, 0].any() and frame[100, 100].any(), "the line y = x runs from the corner, beyond its two points"
+    assert not frame[100, 20].any(), "off the line nothing is drawn"
+
+
+def test_a_crossing_line_outside_the_frame_draws_nothing():
+    frame = np.zeros((120, 160, 3), np.uint8)
+    draw_crossing_line(frame, (0, 300, 160, 300))
+    draw_crossing_line(frame, (50, 50, 50, 50))
+    assert not frame.any()
 
 
 def test_a_box_missing_from_one_result_is_held_then_dropped():

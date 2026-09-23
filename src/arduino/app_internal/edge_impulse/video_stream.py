@@ -37,6 +37,8 @@ EMBED_PAGE = b"""<!DOCTYPE html>
 """
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 TEXT_COLOR = (255, 255, 255)
+LINE_COLOR = (255, 0, 255)
+LINE_THICKNESS = 2
 
 
 class LabelColors:
@@ -197,6 +199,30 @@ def draw_detections(frame: np.ndarray, detections: dict[str, list[dict[str, Any]
                 origin = (left + (chip_w - text_w) // 2, top + pad + (i + 1) * (line_h + pad) - pad // 2)
                 cv2.putText(image, line, origin, FONT, font_scale, TEXT_COLOR, font_thickness, cv2.LINE_AA)
     return image
+
+
+def draw_crossing_line(frame: np.ndarray, line: tuple[int, int, int, int]) -> np.ndarray:
+    """The frame with the straight line through the two points of `line` drawn from edge to edge, in place.
+
+    Args:
+        frame (np.ndarray): HxWx3 BGR frame.
+        line (tuple[int, int, int, int]): Two points of the line, x1, y1, x2, y2, in frame coordinates.
+
+    Returns:
+        np.ndarray: The same frame, drawn on.
+    """
+    x1, y1, x2, y2 = line
+    dx, dy = x2 - x1, y2 - y1
+    if dx == 0 and dy == 0:
+        return frame
+    height, width = frame.shape[:2]
+    beyond_frame = (width + height) / max(abs(dx), abs(dy))
+    start = (round(x1 - dx * beyond_frame), round(y1 - dy * beyond_frame))
+    end = (round(x1 + dx * beyond_frame), round(y1 + dy * beyond_frame))
+    inside, start, end = cv2.clipLine((0, 0, width, height), start, end)
+    if inside:
+        cv2.line(frame, start, end, LINE_COLOR, LINE_THICKNESS)
+    return frame
 
 
 class VideoStreamServer:
