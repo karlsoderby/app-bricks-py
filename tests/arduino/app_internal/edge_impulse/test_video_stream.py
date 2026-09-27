@@ -11,7 +11,7 @@ import urllib.request
 import numpy as np
 import pytest
 
-from arduino.app_internal.edge_impulse import BoxStabilizer, LabelColors, VideoStreamServer, draw_crossing_line, draw_detections
+from arduino.app_internal.edge_impulse import BoxStabilizer, LabelColors, VideoStreamServer, draw_area, draw_crossing_line, draw_detections
 from arduino.app_internal.ei_inference import Box
 
 JPEG_A = b"\xff\xd8A\xff\xd9"
@@ -171,6 +171,15 @@ def test_a_crossing_line_outside_the_frame_draws_nothing():
     draw_crossing_line(frame, (0, 300, 160, 300))
     draw_crossing_line(frame, (50, 50, 50, 50))
     assert not frame.any()
+
+
+def test_the_area_is_drawn_as_a_closed_yellow_outline():
+    frame = np.zeros((120, 160, 3), np.uint8)
+    drawn = draw_area(frame, np.array([(20, 20), (100, 20), (100, 80), (20, 80)]))
+
+    assert drawn is frame, "drawn in place"
+    assert tuple(frame[50, 20]) == (0, 255, 255) and tuple(frame[80, 60]) == (0, 255, 255), "every side, the closing one included"
+    assert not frame[50, 60].any(), "the inside is not filled"
 
 
 def test_a_box_missing_from_one_result_is_held_then_dropped():

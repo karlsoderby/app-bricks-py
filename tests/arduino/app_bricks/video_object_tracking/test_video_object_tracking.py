@@ -317,6 +317,164 @@ def test_a_new_connection_forgets_the_identifiers_and_keeps_the_counts(running, 
     assert brick.get_unique_objects_count() == {"person": 2}, "the same id on a new run of the tracker is a new object"
 
 
+# ---------------------------------------------------------------- area
+
+AREA = (200, 200, 400, 400)
+
+
+def _at(x: int, y: int, object_id: int = 1, label: str = "person") -> dict:
+    """A tracked object whose bounding box centre is at (x, y), with the 80x200 box of `_walk`."""
+    return _track(label=label, object_id=object_id, x=x - 40, y=y - 100)
+
+
+def test_an_object_entering_the_area_is_reported_once(tracker):
+    tracker.set_rectangular_area(*AREA)
+
+    _replay(tracker, [[_at(x, 300)] for x in (100, 150, 250, 300, 350, 300)])
+
+    assert tracker.get_area_counts() == {"person": {"entered": 1}}
+    assert tracker.get_objects_in_area() == {"person": 1}
+
+
+def test_an_object_appearing_inside_the_area_enters_it(tracker):
+    tracker.set_rectangular_area(*AREA)
+
+    _replay(tracker, [[_at(300, 300)]])
+
+    assert tracker.get_area_counts() == {"person": {"entered": 1}}
+
+
+def test_an_object_leaving_the_area_exits_it(tracker):
+    tracker.set_rectangular_area(*AREA)
+
+    _replay(tracker, [[_at(x, 300)] for x in (300, 350, 450, 500)])
+
+    assert tracker.get_area_counts() == {"person": {"entered": 1, "exited": 1}}
+    assert tracker.get_objects_in_area() == {}
+
+
+def test_an_object_disappearing_inside_exits_once_the_tracker_gives_it_up(tracker):
+    tracker.set_rectangular_area(*AREA)
+    _replay(tracker, [[_at(300, 300)], [], [], []])
+    assert tracker.get_objects_in_area() == {"person": 1}, "within keep_grace, 3, the tracker may still bring it back"
+
+    _replay(tracker, [[]])
+
+    assert tracker.get_objects_in_area() == {}
+    assert tracker.get_area_counts() == {"person": {"entered": 1, "exited": 1}}
+
+
+def test_a_centre_wobbling_on_the_border_enters_only_once(tracker):
+    tracker.set_rectangular_area(*AREA)
+
+    _replay(tracker, [[_at(x, 300)] for x in (205, 195, 205, 192, 204)])
+
+    assert tracker.get_area_counts() == {"person": {"entered": 1}}
+    assert tracker.get_objects_in_area() == {"person": 1}
+
+
+def test_setting_the_area_again_counts_the_objects_inside_from_their_next_appearance(tracker):
+    tracker.set_rectangular_area(*AREA)
+    _replay(tracker, [[_at(300, 300)]])
+
+    tracker.set_rectangular_area(*AREA)
+    assert tracker.get_objects_in_area() == {}, "emptied without reporting an exit"
+    _replay(tracker, [[_at(300, 300)]])
+
+    assert tracker.get_area_counts() == {"person": {"entered": 2}}
+
+
+def test_a_new_tracker_run_empties_the_area_without_exits(tracker):
+    tracker.set_rectangular_area(*AREA)
+    _replay(tracker, [[_at(300, 300)]])
+
+    tracker._forget_tracks()
+
+    assert tracker.get_objects_in_area() == {}
+    assert tracker.get_area_counts() == {"person": {"entered": 1}}
+
+
+def test_reset_counters_clears_the_entries_and_exits_but_not_the_objects_inside(tracker):
+    tracker.set_rectangular_area(*AREA)
+    _replay(tracker, [[_at(300, 300)]])
+
+    tracker.reset_counters()
+
+    assert tracker.get_area_counts() == {}
+    assert tracker.get_objects_in_area() == {"person": 1}
+
+
+def test_the_area_follows_only_the_labels_to_track(service, camera):
+    brick = VideoObjectTracking(camera=camera, stream_port=0, labels_to_track=["cup"])
+    try:
+        brick.set_rectangular_area(*AREA)
+        _replay(brick, [[_at(300, 300, object_id=1, label="person"), _at(300, 300, object_id=2, label="cup")]])
+        assert brick.get_area_counts() == {"cup": {"entered": 1}}
+    finally:
+        brick.stop()
+
+
+def test_a_concave_area_leaves_out_its_notch(tracker):
+    tracker.set_area_coordinates([(100, 100), (500, 100), (500, 200), (200, 200), (200, 300), (500, 300), (500, 400), (100, 400)])
+
+    _replay(tracker, [[_at(400, 250, object_id=1), _at(400, 150, object_id=2)]])
+
+    assert tracker.get_objects_in_area() == {"person": 1}, "the object in the notch of the C is outside"
+
+
+def test_the_rectangle_helper_takes_its_corners_in_any_order(tracker):
+    tracker.set_rectangular_area(400, 400, 200, 200)
+
+    _replay(tracker, [[_at(300, 300)]])
+
+    assert tracker.get_objects_in_area() == {"person": 1}
+
+
+def test_an_area_needs_three_distinct_points(tracker):
+    with pytest.raises(ValueError):
+        tracker.set_area_coordinates([(0, 0), (100, 100)])
+    with pytest.raises(ValueError):
+        tracker.set_area_coordinates([(0, 0), (0, 0), (100, 100)])
+    with pytest.raises(ValueError):
+        tracker.set_rectangular_area(100, 100, 100, 300)
+
+
+def test_the_area_callbacks_receive_the_object(tracker):
+    entered, exited = queue.Queue(), queue.Queue()
+
+    def on_enter(event):
+        entered.put(event)
+
+    def on_exit(event):
+        exited.put(event)
+
+    tracker.on_area_enter(on_enter)
+    tracker.on_area_exit(on_exit)
+    tracker.set_rectangular_area(*AREA)
+    _replay(tracker, [[_at(x, 300, object_id=7)] for x in (300, 500)])
+
+    assert entered.get(timeout=TIMEOUT) == {"label": "person", "object_id": 7}
+    assert exited.get(timeout=TIMEOUT) == {"label": "person", "object_id": 7}
+
+
+def test_the_area_callbacks_must_be_functions(tracker):
+    with pytest.raises(TypeError):
+        tracker.on_area_enter("not a function")
+    with pytest.raises(TypeError):
+        tracker.on_area_exit("not a function")
+
+
+def test_the_area_outline_is_drawn_on_the_video_in_yellow(tracker):
+    frame = np.zeros((480, 640, 3), np.uint8)
+    tracker.set_rectangular_area(*AREA)
+
+    annotated = tracker._annotate(frame)
+
+    assert tuple(annotated[300, 200]) == (0, 255, 255), "the left side of the outline"
+    assert not annotated[300, 300].any(), "the inside stays as the camera shows it"
+    assert not frame.any(), "the camera frame itself is left untouched"
+
+
 # ---------------------------------------------------------------- counting
 
 

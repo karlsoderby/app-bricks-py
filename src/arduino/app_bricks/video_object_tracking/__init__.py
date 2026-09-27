@@ -11,10 +11,11 @@ from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
+import cv2
 import numpy as np
 
 from arduino.app_bricks.video_objectdetection import STREAM_PORT, AllDetectionsCallback, DetectionCallback, VideoObjectDetection
-from arduino.app_internal.edge_impulse import draw_crossing_line
+from arduino.app_internal.edge_impulse import draw_area, draw_crossing_line
 from arduino.app_internal.ei_inference import InferenceClient, Result, ServerError
 from arduino.app_peripherals.camera import BaseCamera
 from arduino.app_utils import AppError, Logger, LRUDict, brick
@@ -28,6 +29,8 @@ TRACKING_BLOCK = "object_tracking"  # the threshold block holding the tracker kn
 
 type LineCrossingCallback = Callable[[dict[str, Any]], None]
 """Callback accepted by `on_line_crossing`: one dict argument, `{"label": str, "object_id": int, "direction": str}`."""
+type AreaCallback = Callable[[dict[str, Any]], None]
+"""Callback accepted by `on_area_enter` and `on_area_exit`: one dict argument, `{"label": str, "object_id": int}`."""
 
 
 class VideoObjectTrackingError(AppError):
@@ -102,6 +105,11 @@ class VideoObjectTracking(VideoObjectDetection):
         self._line_crossing_handler: LineCrossingCallback | None = None
         self._object_directions: dict[int, list[str]] = {}  # direction history, per object id
         self._min_movement_threshold = min_movement_threshold
+        self._area: np.ndarray | None = None  # the vertices of the watched area, as OpenCV takes a polygon
+        self._area_present: dict[int, tuple[str, int]] = {}  # objects inside the area: id -> (label, results since last seen)
+        self._area_counts: dict[str, Counter[str]] = {}  # entries and exits of the area, per label
+        self._area_enter_handler: AreaCallback | None = None
+        self._area_exit_handler: AreaCallback | None = None
 
         self._require_object_tracking()
 
@@ -223,11 +231,54 @@ class VideoObjectTracking(VideoObjectDetection):
             handler = self._line_crossing_handler
         logger.debug(f"Object ID {object_id} crossed the line from ({last_x}, {last_y}) to ({x}, {y}) moving {direction}")
         if handler is not None:
-            crossing = {"label": detected_object_label, "object_id": object_id, "direction": direction}
-            try:
-                self._executor.submit(handler, crossing)
-            except RuntimeError:  # the executor was shut down before the task could be submitted
-                pass
+            self._submit_event(handler, {"label": detected_object_label, "object_id": object_id, "direction": direction})
+
+    def _record_area(self, tracked: list[tuple[str, int, int, int]]) -> None:
+        """Follow the objects of one result in and out of the area, (label, id, x, y) each at its reference point.
+
+        An object enters when it is seen inside and is not among the ones present, and leaves when it is seen more
+        than `min_movement_threshold` pixels outside or has been missing for more results than `keep_grace`.
+        """
+        events: list[tuple[str, str, int]] = []
+        with self._counter_lock:
+            if self._area is None:
+                return
+            seen = set()
+            for label, object_id, x, y in tracked:
+                seen.add(object_id)
+                distance = cv2.pointPolygonTest(self._area, (float(x), float(y)), True)  # positive inside, negative outside
+                if object_id in self._area_present:
+                    if distance < -self._min_movement_threshold:
+                        del self._area_present[object_id]
+                        events.append(("exited", label, object_id))
+                    else:
+                        self._area_present[object_id] = (label, 0)
+                elif distance >= 0:
+                    self._area_present[object_id] = (label, 0)
+                    events.append(("entered", label, object_id))
+            for object_id, (label, missing) in list(self._area_present.items()):
+                if object_id in seen:
+                    continue
+                if missing + 1 > self._tracker["max_age"]:
+                    del self._area_present[object_id]
+                    events.append(("exited", label, object_id))
+                else:
+                    self._area_present[object_id] = (label, missing + 1)
+            for kind, label, _ in events:
+                self._area_counts.setdefault(label, Counter())[kind] += 1
+            handlers = {"entered": self._area_enter_handler, "exited": self._area_exit_handler}
+        for kind, label, object_id in events:
+            handler = handlers[kind]
+            logger.debug(f"Object ID {object_id} ({label}) {kind} the area")
+            if handler is not None:
+                self._submit_event(handler, {"label": label, "object_id": object_id})
+
+    def _submit_event(self, handler: Callable[[dict[str, Any]], None], event: dict[str, Any]) -> None:
+        """Run an event handler on the executor, so it never delays the processing of the results."""
+        try:
+            self._executor.submit(handler, event)
+        except RuntimeError:  # the executor was shut down before the task could be submitted
+            pass
 
     def _record_object_direction(self, detected_object_label: str, object_id: int, x: int, y: int) -> None:
         """
@@ -260,6 +311,7 @@ class VideoObjectTracking(VideoObjectDetection):
         with self._counter_lock:
             self._recent_objects.clear()
             self._object_directions.clear()
+            self._area_present.clear()
 
     def get_unique_objects_count(self) -> dict[str, int]:
         """
@@ -283,6 +335,27 @@ class VideoObjectTracking(VideoObjectDetection):
         """
         with self._counter_lock:
             return {label: {**counts, "all": counts.total()} for label, counts in self._crossing_line_object.items()}
+
+    def get_objects_in_area(self) -> dict[str, int]:
+        """
+        Get the objects inside the area now, per label.
+
+        Returns:
+            dict: A dictionary with labels as keys and the number of their objects inside the area as values.
+        """
+        with self._counter_lock:
+            return dict(Counter(label for label, _ in self._area_present.values()))
+
+    def get_area_counts(self) -> dict[str, dict[str, int]]:
+        """
+        Get the entries into the area and the exits from it since the last reset, per label.
+
+        Returns:
+            dict: `{label: {"entered": count, "exited": count}}`; an object that disappears inside the area counts
+                as exited once the tracker has lost it. Only the events seen appear.
+        """
+        with self._counter_lock:
+            return {label: dict(counts) for label, counts in self._area_counts.items()}
 
     def get_objects_directions(self) -> dict[int, list[str]]:
         """
@@ -327,12 +400,49 @@ class VideoObjectTracking(VideoObjectDetection):
         """
         self.set_crossing_line_coordinates(x, 0, x, 1)
 
+    def set_area_coordinates(self, points: list[tuple[int, int]]) -> None:
+        """
+        Set the area watched for objects entering and leaving it: the polygon through the points, in the order they
+        follow its border. The objects inside are counted again from their next appearance.
+
+        Args:
+            points (list[tuple[int, int]]): At least three distinct (x, y) points in frame coordinates; the polygon
+                may be concave.
+
+        Raises:
+            ValueError: If fewer than three distinct points are given.
+        """
+        polygon = np.array([(int(x), int(y)) for x, y in points], dtype=np.int32)
+        if len({(x, y) for x, y in polygon.tolist()}) < 3:
+            raise ValueError("An area needs at least three distinct points.")
+        with self._counter_lock:
+            self._area = polygon.reshape(-1, 1, 2)
+            self._area_present.clear()
+
+    def set_rectangular_area(self, x1: int, y1: int, x2: int, y2: int) -> None:
+        """
+        Set a rectangular area watched for objects entering and leaving it.
+
+        Args:
+            x1 (int): The x-coordinate of a corner.
+            y1 (int): The y-coordinate of a corner.
+            x2 (int): The x-coordinate of the opposite corner.
+            y2 (int): The y-coordinate of the opposite corner.
+
+        Raises:
+            ValueError: If the rectangle has no width or no height.
+        """
+        left, right = sorted((x1, x2))
+        top, bottom = sorted((y1, y2))
+        self.set_area_coordinates([(left, top), (right, top), (right, bottom), (left, bottom)])
+
     def reset_counters(self) -> None:
         """Reset the counts of tracked objects."""
         with self._counter_lock:
             self._object_counters.clear()
             self._recent_objects.clear()
             self._crossing_line_object.clear()
+            self._area_counts.clear()
 
     def on_detect(self, object: str, callback: DetectionCallback) -> None:  # noqa: A002
         """Register a callback invoked when a **specific label** is tracked.
@@ -364,6 +474,34 @@ class VideoObjectTracking(VideoObjectDetection):
         with self._counter_lock:
             self._line_crossing_handler = callback
 
+    def on_area_enter(self, callback: AreaCallback) -> None:
+        """Register a callback invoked **every time a tracked object enters the area**.
+
+        Args:
+            callback (AreaCallback): A plain function taking one dict argument, `{"label": str, "object_id": int}`.
+
+        Raises:
+            TypeError: If `callback` is not a function.
+        """
+        if not inspect.isfunction(callback):
+            raise TypeError("Callback must be a callable function.")
+        with self._counter_lock:
+            self._area_enter_handler = callback
+
+    def on_area_exit(self, callback: AreaCallback) -> None:
+        """Register a callback invoked **every time a tracked object leaves the area**, or disappears inside it.
+
+        Args:
+            callback (AreaCallback): A plain function taking one dict argument, `{"label": str, "object_id": int}`.
+
+        Raises:
+            TypeError: If `callback` is not a function.
+        """
+        if not inspect.isfunction(callback):
+            raise TypeError("Callback must be a callable function.")
+        with self._counter_lock:
+            self._area_exit_handler = callback
+
     def on_detect_all(self, callback: AllDetectionsCallback) -> None:
         """Register a callback invoked for **every frame with tracked objects**.
 
@@ -387,12 +525,15 @@ class VideoObjectTracking(VideoObjectDetection):
 
         tracked = [(track, track.id) for track in result.tracks if track.id is not None and self._is_label_enabled(track.label)]
         detections: dict[str, list[dict[str, Any]]] = {}
+        centres: list[tuple[str, int, int, int]] = []
         for track, object_id in tracked:
             x1, y1, x2, y2 = round(track.x), round(track.y), round(track.x + track.w), round(track.y + track.h)
             details = {"object_id": object_id, "confidence": track.score, "bounding_box_xyxy": (x1, y1, x2, y2)}
             detections.setdefault(track.label, []).append(details)
             self._record_object(track.label, object_id, (x1 + x2) // 2, (y1 + y2) // 2)
+            centres.append((track.label, object_id, (x1 + x2) // 2, (y1 + y2) // 2))
             self._execute_handler(key=track.label, payload=details)
+        self._record_area(centres)
         # The video shows every tracked object under its label and id
         self._boxes.update(
             [replace(track, label=f"{track.label} #{object_id}") for track, object_id in tracked], (time.monotonic_ns() - result.ts_ns) / 1e9
@@ -401,11 +542,15 @@ class VideoObjectTracking(VideoObjectDetection):
             self._execute_handler(key=self.ALL_HANDLERS_KEY, payload=detections)
 
     def _annotate(self, frame: np.ndarray) -> np.ndarray:
-        """A copy of the frame with the tracked boxes and, when a crossing line is set, the line drawn across it."""
+        """A copy of the frame with the tracked boxes and, when set, the crossing line and the outline of the area."""
         annotated = super()._annotate(frame)
         with self._counter_lock:
-            line = self._line_coordinates
-        return draw_crossing_line(annotated, line) if line is not None else annotated
+            line, area = self._line_coordinates, self._area
+        if line is not None:
+            draw_crossing_line(annotated, line)
+        if area is not None:
+            draw_area(annotated, area)
+        return annotated
 
     def override_keep_grace(self, keep_grace: int) -> None:
         """Override keep grace for object tracking model.
